@@ -1,103 +1,245 @@
-import torch
-from src.MaskingDependencies import MaskingDependencies
 import json
-from llm_sdk import llm_sdk
+import shutil
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import torch
+from llm_sdk.llm_sdk import Small_LLM_Model
+from pydantic import ValidationError
+
+from src.schemas import FunctionCallAnswer, FunctionDefinition, PromptItem
 
 FUNCTIONS_PATH = "data/input/functions_definition.json"
 PROMPTS_PATH = "data/input/function_calling_tests.json"
-OUTPUT_PAtH = "data/output/function_calling_results.json"
+OUTPUT_JSON_PATH = "data/output/results.json"
+OUTPUT_JSONL_PATH = "data/output/results.jsonl"
+MAX_NEW_TOKENS = 256
+MAX_RETRIES = 3
+MIN_FREE_DISK_BYTES_FOR_MPS = 2 * 1024 * 1024 * 1024
+RAW_ANSWER_SNIP_LEN = 2000
 
 
-# def logits_masking(logits):
+def load_json(file_path: str) -> Any:
+    with open(file_path, "r", encoding="utf-8") as file:
+        return json.load(file)
 
 
+def extract_first_json_object(text: str) -> str | None:
+    start_idx = -1
+    depth = 0
+    in_string = False
+    escaped = False
 
-def load_json(file_path: str):
-    try:
-        with open(file_path, "r", encoding='utf-8') as f:
-            result = json.load(f)
-            return result
-    except Exception as e:
-        print("An error occured while reading the prompt file.\n", e)
-        return None
+    for idx, char in enumerate(text):
+        if start_idx == -1:
+            if char == "{":
+                start_idx = idx
+                depth = 1
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start_idx: idx + 1]
+
+    return None
 
 
-import json
+def build_system_prompt(functions: list[FunctionDefinition]) -> str:
+    return f"""You are a function calling assistant.
+Return one strict JSON object only, no markdown and no extra text.
+The JSON must have this shape:
+{{"name":"<function_name>", "parameters":{{...}}}}
 
-def main():
-    prompts = load_json("data/input/function_calling_tests.json")
-    functions = load_json("data/input/functions_definition.json")
-    model = llm_sdk.Small_LLM_Model(model_name="Qwen/Qwen3-0.6B")
-    
-    mask = MaskingDependencies(model, functions)
-    end_token_id = model.encode("}")[0][-1].item()
-    
-    # Создаем список для хранения всех результатов
-    output_results = []
-    
-    for prompt in prompts:
-        user_query = prompt['prompt']
-
-        system_prompt = f"""You are a function calling assistant. You must output strictly valid JSON matching the function schema.
 Available functions:
-{json.dumps(functions, indent=2)}
-
-Example:
-User query: add 10 and 20
-Result: {{"name": "fn_add_numbers", "parameters": {{"a": 10, "b": 20}}}}
+{json.dumps([f.model_dump() for f in functions], indent=2)}
 """
 
-        final_prompt = f"{system_prompt}\n\nUser query: {user_query}\nResult: {{"
-        ids = model.encode(final_prompt)[0].tolist()
-        
+
+def choose_device() -> str | None:
+    free_bytes = shutil.disk_usage("/").free
+    if free_bytes < MIN_FREE_DISK_BYTES_FOR_MPS:
+        print(
+            f"Low disk space ({free_bytes / (1024 ** 3):.2f} GB free). "
+            "Using CPU to avoid MPS graph cache failures."
+        )
+        return "cpu"
+    return None
+
+
+def generate_answer(
+    model: Small_LLM_Model,
+    system_prompt: str,
+    user_query: str,
+) -> str:
+    user_query = user_query.replace("'", '"')
+    final_prompt = f"{system_prompt}\nUser query: {user_query}\nResult: "
+    ids = model.encode(final_prompt)[0].tolist()
+    generated_text = ""
+    for _ in range(MAX_NEW_TOKENS):
+        logits = model.get_logits_from_input_ids(ids)
+        next_token_id = int(torch.tensor(logits).argmax().item())
+        ids.append(next_token_id)
+
+        token_text = model.decode([next_token_id])
+        generated_text += token_text
+
+        if "}" in token_text:
+            maybe_json = extract_first_json_object(generated_text)
+            if maybe_json is not None:
+                return maybe_json
+
+    full_generated = model.decode(ids).split(
+        "Result: ", maxsplit=1)[-1].strip()
+    maybe_json = extract_first_json_object(full_generated)
+    return maybe_json or full_generated
+
+
+def parse_function_call_dict(raw: str) -> dict[str, Any]:
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "Top-level JSON must be an object with name and parameters")
+    if "name" not in parsed or "parameters" not in parsed:
+        raise ValueError('Expected keys "name" and "parameters"')
+    if not isinstance(parsed["parameters"], dict):
+        raise ValueError('"parameters" must be a JSON object')
+    return parsed
+
+
+def validate_answer(
+    answer_obj: dict[str, Any],
+    functions_by_name: dict[str, FunctionDefinition],
+) -> FunctionCallAnswer:
+    answer = FunctionCallAnswer.model_validate(answer_obj)
+    function = functions_by_name.get(answer.name)
+    if function is None:
+        raise ValueError(f"Unknown function: {answer.name}")
+
+    expected_parameters = function.parameters
+    provided_keys = set(answer.parameters.keys())
+    expected_keys = set(expected_parameters.keys())
+    if provided_keys != expected_keys:
+        raise ValueError(
+            f"Invalid parameter keys for {answer.name}:"
+            " expected {sorted(expected_keys)}, got {sorted(provided_keys)}"
+        )
+
+    for param_name, param_def in expected_parameters.items():
+        value = answer.parameters[param_name]
+        p_type = param_def.type
+
+        if p_type == "string" and not isinstance(value, str):
+            raise ValueError(f"Parameter '{param_name}' must be string")
+        if p_type == "number" and not isinstance(value, (int, float)):
+            raise ValueError(f"Parameter '{param_name}' must be number")
+        if p_type == "integer" and not isinstance(value, int):
+            raise ValueError(f"Parameter '{param_name}' must be integer")
+        if p_type == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"Parameter '{param_name}' must be boolean")
+
+    return answer
+
+
+def truncate_for_log(text: str, limit: int = RAW_ANSWER_SNIP_LEN) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}… (truncated, {len(text)} chars)"
+
+
+def iter_prompt_results(
+    model: Small_LLM_Model,
+    system_prompt: str,
+    prompts: list[PromptItem],
+    functions_by_name: dict[str, FunctionDefinition],
+) -> Iterator[dict[str, Any]]:
+    for prompt in prompts:
+        user_query = prompt.prompt
         print(f"Processing Query: {user_query}")
-        
-        for i in range(50):
-            logits = model.get_logits_from_input_ids(ids)
-            masked_logits = mask.apply_constrain(logits, ids)
-            next_token_id = torch.argmax(masked_logits).item()
-            
-            ids.append(next_token_id)
 
-            char = model.decode([next_token_id])
-            
-            if "}" in char:
-                current_gen = model.decode(ids).split("Result: ")[-1]
-                open_b = current_gen.count('{')
-                close_b = current_gen.count('}')
-                if open_b == close_b and open_b > 0:
-                    break
+        validated_answer: FunctionCallAnswer | None = None
+        raw_answer = ""
+        for attempt in range(MAX_RETRIES):
+            raw_answer = generate_answer(model, system_prompt, user_query)
+            try:
+                parsed = parse_function_call_dict(raw_answer)
+                validated_answer = validate_answer(parsed, functions_by_name)
+                break
+            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+                print(
+                    f"Retry {attempt + 1}/{MAX_RETRIES}"
+                    f" because answer is invalid: {exc!s}. "
+                    f"raw_snip={truncate_for_log(raw_answer)!r}"
+                )
 
-        # Декодируем и чистим JSON
-        full_text = model.decode(ids)
-        final_json_str = full_text.split("Result: ")[-1].strip()
+        if validated_answer is None:
+            answer_payload: Any = {
+                "error": "invalid_model_output",
+                "raw_answer_snip": truncate_for_log(raw_answer),
+            }
+        else:
+            answer_payload = validated_answer.model_dump()
 
-        # Пытаемся распарсить строку в объект Python, чтобы сохранить как валидный JSON
-        try:
-            json_obj = json.loads(final_json_str)
-        except Exception as e:
-            print(f"Warning: Could not parse model output as JSON: {e}")
-            json_obj = final_json_str # Сохраняем как строку, если парсинг не удался
-
-        # Добавляем в общий список в нужном формате
-        output_results.append({
-            "prompt": user_query,
-            "answer": json_obj
-        })
-        
-        print(f"Done.")
+        yield {"prompt": user_query, "answer": answer_payload}
+        print("Done.")
         print("-" * 20)
 
-    # ЗАПИСЬ В ФАЙЛ
-    output_path = "data/output/results.json"
-    try:
-        with open(output_path, "w", encoding='utf-8') as f:
-            # indent=4 сделает файл читаемым для человека
-            # ensure_ascii=False сохранит символы как есть (важно для кириллицы/японского)
-            json.dump(output_results, f, indent=4, ensure_ascii=False)
-        print(f"Successfully saved results to {output_path}")
-    except Exception as e:
-        print(f"Error saving file: {e}")
+
+def jsonl_to_json_array(jsonl_path: Path, json_path: Path) -> None:
+    rows: list[dict[str, Any]] = []
+    with jsonl_path.open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with json_path.open("w", encoding="utf-8") as file:
+        json.dump(rows, file, indent=4, ensure_ascii=False)
+
+
+def main() -> None:
+    prompts_raw = load_json(PROMPTS_PATH)
+    functions_raw = load_json(FUNCTIONS_PATH)
+
+    prompts = [PromptItem.model_validate(prompt) for prompt in prompts_raw]
+    functions = [FunctionDefinition.model_validate(f) for f in functions_raw]
+    functions_by_name = {function.name: function for function in functions}
+
+    model = Small_LLM_Model(
+        model_name="Qwen/Qwen3-0.6B", device=choose_device())
+    system_prompt = build_system_prompt(functions)
+
+    output_jsonl = Path(OUTPUT_JSONL_PATH)
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_jsonl.open("w", encoding="utf-8") as jsonl_file:
+        for row in iter_prompt_results(model,
+                                       system_prompt,
+                                       prompts,
+                                       functions_by_name):
+            jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+            jsonl_file.flush()
+
+    jsonl_to_json_array(output_jsonl, Path(OUTPUT_JSON_PATH))
+    print(f"Saved line-by-line results to {output_jsonl}")
+    print(f"Wrote combined JSON array to {OUTPUT_JSON_PATH}")
+
 
 if __name__ == "__main__":
     main()

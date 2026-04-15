@@ -1,5 +1,47 @@
 [
     {
+        "prompt": "Replace all vowels in 'Programming is fun' with asterisks",
+        "answer": {
+            "name": "fn_substitute_string_with_regex",
+            "parameters": {
+                "source_string": "Programming is fun",
+                "regex": "[aeiouAEIOU]",
+                "replacement": "*"
+            }
+        }
+    },
+    {
+        "prompt": "Calculate the square root of 144",
+        "answer": {
+            "name": "fn_get_square_root",
+            "parameters": {
+                "a": 144
+            }
+        }
+    },
+    {
+        "prompt": "Replace all numbers in \"Hello 34 I'm 233 years old\" with NUMBERS",
+        "answer": {
+            "name": "fn_substitute_string_with_regex",
+            "parameters": {
+                "source_string": "Hello 34 I'm 233 years old",
+                "regex": "([0-9]+)",
+                "replacement": "NUMBERS"
+            }
+        }
+    },
+    {
+        "prompt": "Substitute the word 'cat' with 'dog' in 'The cat sat on the mat with another cat'",
+        "answer": {
+            "name": "fn_substitute_string_with_regex",
+            "parameters": {
+                "source_string": "The cat sat on the mat with another cat",
+                "regex": "/cat/",
+                "replacement": "dog"
+            }
+        }
+    },
+    {
         "prompt": "What is the sum of 2 and 3?",
         "answer": {
             "name": "fn_add_numbers",
@@ -24,7 +66,7 @@
         "answer": {
             "name": "fn_greet",
             "parameters": {
-                "name": "fn_greet"
+                "name": "shrek"
             }
         }
     },
@@ -33,7 +75,7 @@
         "answer": {
             "name": "fn_greet",
             "parameters": {
-                "name": "fn_greet"
+                "name": "john"
             }
         }
     },
@@ -61,41 +103,6 @@
             "name": "fn_get_square_root",
             "parameters": {
                 "a": 16
-            }
-        }
-    },
-    {
-        "prompt": "Calculate the square root of 144",
-        "answer": {
-            "name": "fn_get_square_root",
-            "parameters": {
-                "a": 144
-            }
-        }
-    },
-    {
-        "prompt": "Replace all numbers in \"Hello 34 I'm 233 years old\" with NUMBERS",
-        "answer": "{ \"name\": \"fn_substitute_string_with_regex\", \"parameters\": { \"source_string\": \"Hello 34 I'm 233 years old\", \"regex\": \"([0-9]+)\", \"replacement\": \"NUMBERS\""
-    },
-    {
-        "prompt": "Replace all vowels in 'Programming is fun' with asterisks",
-        "answer": {
-            "name": "fn_substitute_string_with_regex",
-            "parameters": {
-                "source_string": "Programming is fun",
-                "regex": "([aeiou])",
-                "replacement": "*"
-            }
-        }
-    },
-    {
-        "prompt": "Substitute the word 'cat' with 'dog' in 'The cat sat on the mat with another cat'",
-        "answer": {
-            "name": "fn_substitute_string_with_regex",
-            "parameters": {
-                "source_string": "The cat sat on the mat with another cat",
-                "regex": "cat",
-                "replacement": "dog"
             }
         }
     }
