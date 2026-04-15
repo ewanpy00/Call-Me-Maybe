@@ -3,21 +3,38 @@ import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-
 import torch
+import time
+
 from llm_sdk.llm_sdk import Small_LLM_Model
 from pydantic import ValidationError
+import argparse
 
 from src.schemas import FunctionCallAnswer, FunctionDefinition, PromptItem
 
-FUNCTIONS_PATH = "data/input/functions_definition.json"
-PROMPTS_PATH = "data/input/function_calling_tests.json"
-OUTPUT_JSON_PATH = "data/output/results.json"
-OUTPUT_JSONL_PATH = "data/output/results.jsonl"
 MAX_NEW_TOKENS = 256
 MAX_RETRIES = 3
 MIN_FREE_DISK_BYTES_FOR_MPS = 2 * 1024 * 1024 * 1024
 RAW_ANSWER_SNIP_LEN = 2000
+
+
+def parse():
+    parser = argparse.ArgumentParser("Project Runner")
+    parser.add_argument("--function_definition",
+                        type=str,
+                        default='data/input/functions_definition.json',
+                        help="Path to function's definitions")
+    parser.add_argument("--input",
+                        type=str,
+                        default='data/input/function_calling_tests.json',
+                        help="Path to input file")
+    parser.add_argument("--output",
+                        type=str,
+                        default='data/output/result.json',
+                        help="Path to output file")
+    args = parser.parse_args()
+
+    return args
 
 
 def load_json(file_path: str) -> Any:
@@ -195,7 +212,10 @@ def iter_prompt_results(
         else:
             answer_payload = validated_answer.model_dump()
 
-        yield {"prompt": user_query, "answer": answer_payload}
+        yield {
+            "prompt": user_query,
+            **answer_payload
+        }
         print("Done.")
         print("-" * 20)
 
@@ -213,33 +233,60 @@ def jsonl_to_json_array(jsonl_path: Path, json_path: Path) -> None:
         json.dump(rows, file, indent=4, ensure_ascii=False)
 
 
-def main() -> None:
-    prompts_raw = load_json(PROMPTS_PATH)
-    functions_raw = load_json(FUNCTIONS_PATH)
+def main():
+    start_time = time.perf_counter()
+    try:
+        args = parse()
+        OUTPUT_PATH = Path(args.output)
+        PROMPTS_PATH = Path(args.input)
+        FUNCTIONS_PATH = Path(args.function_definition)
+    except SystemExit:
+        return
 
-    prompts = [PromptItem.model_validate(prompt) for prompt in prompts_raw]
-    functions = [FunctionDefinition.model_validate(f) for f in functions_raw]
-    functions_by_name = {function.name: function for function in functions}
+    try:
+        prompts_raw = load_json(PROMPTS_PATH)
+        functions_raw = load_json(FUNCTIONS_PATH)
+
+        prompts = [PromptItem.model_validate(p) for p in prompts_raw]
+        functions = [
+            FunctionDefinition.model_validate(f) for f in functions_raw]
+        functions_by_name = {f.name: f for f in functions}
+
+    except FileNotFoundError as e:
+        print(f"CRITICAL: File not found - {e.filename}")
+        return
+    except json.JSONDecodeError as e:
+        print(f"CRITICAL: Invalid JSON format in input files - {e}")
+        return
+    except ValidationError as e:
+        print(f"CRITICAL: Data validation failed (Pydantic):\n{e}")
+        return
+    except Exception as e:
+        print(f"CRITICAL: Unexpected error during initialization: {e}")
+        return
 
     model = Small_LLM_Model(
-        model_name="Qwen/Qwen3-0.6B", device=choose_device())
+        model_name="Qwen/Qwen3-0.6B",
+        device=choose_device())
     system_prompt = build_system_prompt(functions)
 
-    output_jsonl = Path(OUTPUT_JSONL_PATH)
-    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    with output_jsonl.open("w", encoding="utf-8") as jsonl_file:
-        for row in iter_prompt_results(model,
-                                       system_prompt,
-                                       prompts,
-                                       functions_by_name):
-            jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
-            jsonl_file.flush()
+    try:
+        with OUTPUT_PATH.with_suffix('.jsonl').open("w",
+                                                    encoding="utf-8") as f:
+            for row in iter_prompt_results(model,
+                                           system_prompt,
+                                           prompts,
+                                           functions_by_name):
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                f.flush()
 
-    jsonl_to_json_array(output_jsonl, Path(OUTPUT_JSON_PATH))
-    print(f"Saved line-by-line results to {output_jsonl}")
-    print(f"Wrote combined JSON array to {OUTPUT_JSON_PATH}")
+        jsonl_to_json_array(OUTPUT_PATH.with_suffix('.jsonl'), OUTPUT_PATH)
+        end_time = time.perf_counter()
+        final_time = end_time - start_time
+        print(f"{final_time//60} mins {final_time % 60} seconds")
+        print(f"Success! Results saved to {OUTPUT_PATH}")
 
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        print(f"An error occurred during generation: {e}")
