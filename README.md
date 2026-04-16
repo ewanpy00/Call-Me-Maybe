@@ -8,3 +8,8 @@
 
 One of the diffictulties that I faced is the difference with "" and '' I spent the whole day trying to find the mistake in "prompt": "Replace all vowels in 'Programming is fun' with asterisks" because I was not able to notice different quote type 
 
+
+4 mins 10 sec
+
+
+Add a caching method in LLM - advice for a subject creators

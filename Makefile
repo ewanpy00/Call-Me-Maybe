@@ -1,8 +1,12 @@
+f ?= data/input/functions_definition.json
+i ?= data/input/function_calling_tests.json
+o ?= data/output/result.json
+
 install:
 	uv sync
 
 run:
-	uv run python -m src
+	uv run python -m src -function_definition $(f) -input $(i) -output $(o)
 
 debug:
 	uv run python -m pdb -m src
@@ -12,11 +16,8 @@ clean:
 	rm -rf src/__pycache__
 	rm -rf data/output/*
 	rm -rf llm_sdk/llm_sdk/__pycache__
+	rm -rf data/output
 
 lint:
-	uv run flake8 .
-	uv run mypy . --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
-
-lint-strict:
-	uv run flake8 .
-	uv run mypy . --strict
+	flake8 --exclude .venv,llm_sdk
+	mypy src --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs

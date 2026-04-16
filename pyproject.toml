@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "flake8>=7.3.0",
     "huggingface>=0.0.1",
+    "mypy>=1.20.1",
     "numpy>=2.0.2",
     "pydantic>=2.12.5",
     "torch>=2.8.0",

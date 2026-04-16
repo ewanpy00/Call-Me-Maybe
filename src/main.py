@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import json
-import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -10,70 +11,35 @@ from llm_sdk.llm_sdk import Small_LLM_Model
 from pydantic import ValidationError
 import argparse
 
-from src.schemas import FunctionCallAnswer, FunctionDefinition, PromptItem
+from src.validators import FunctionCallAnswer
+from src.validators import FunctionDefinition, PromptItem, validate_answer
+from src.json_helpers import jsonl_to_json_array, load_json
+from src.json_helpers import extract_first_json_object
 
 MAX_NEW_TOKENS = 256
 MAX_RETRIES = 3
-MIN_FREE_DISK_BYTES_FOR_MPS = 2 * 1024 * 1024 * 1024
-RAW_ANSWER_SNIP_LEN = 2000
 
 
-def parse():
+def parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Project Runner")
-    parser.add_argument("--function_definition",
+    parser.add_argument(
+                        "-function_definition",
                         type=str,
                         default='data/input/functions_definition.json',
                         help="Path to function's definitions")
-    parser.add_argument("--input",
+    parser.add_argument(
+                        "-input",
                         type=str,
                         default='data/input/function_calling_tests.json',
                         help="Path to input file")
-    parser.add_argument("--output",
+    parser.add_argument(
+                        "-output",
                         type=str,
                         default='data/output/result.json',
                         help="Path to output file")
     args = parser.parse_args()
 
     return args
-
-
-def load_json(file_path: str) -> Any:
-    with open(file_path, "r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def extract_first_json_object(text: str) -> str | None:
-    start_idx = -1
-    depth = 0
-    in_string = False
-    escaped = False
-
-    for idx, char in enumerate(text):
-        if start_idx == -1:
-            if char == "{":
-                start_idx = idx
-                depth = 1
-            continue
-
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start_idx: idx + 1]
-
-    return None
 
 
 def build_system_prompt(functions: list[FunctionDefinition]) -> str:
@@ -85,17 +51,6 @@ The JSON must have this shape:
 Available functions:
 {json.dumps([f.model_dump() for f in functions], indent=2)}
 """
-
-
-def choose_device() -> str | None:
-    free_bytes = shutil.disk_usage("/").free
-    if free_bytes < MIN_FREE_DISK_BYTES_FOR_MPS:
-        print(
-            f"Low disk space ({free_bytes / (1024 ** 3):.2f} GB free). "
-            "Using CPU to avoid MPS graph cache failures."
-        )
-        return "cpu"
-    return None
 
 
 def generate_answer(
@@ -138,47 +93,6 @@ def parse_function_call_dict(raw: str) -> dict[str, Any]:
     return parsed
 
 
-def validate_answer(
-    answer_obj: dict[str, Any],
-    functions_by_name: dict[str, FunctionDefinition],
-) -> FunctionCallAnswer:
-    answer = FunctionCallAnswer.model_validate(answer_obj)
-    function = functions_by_name.get(answer.name)
-    if function is None:
-        raise ValueError(f"Unknown function: {answer.name}")
-
-    expected_parameters = function.parameters
-    provided_keys = set(answer.parameters.keys())
-    expected_keys = set(expected_parameters.keys())
-    if provided_keys != expected_keys:
-        raise ValueError(
-            f"Invalid parameter keys for {answer.name}:"
-            " expected {sorted(expected_keys)}, got {sorted(provided_keys)}"
-        )
-
-    for param_name, param_def in expected_parameters.items():
-        value = answer.parameters[param_name]
-        p_type = param_def.type
-
-        if p_type == "string" and not isinstance(value, str):
-            raise ValueError(f"Parameter '{param_name}' must be string")
-        if p_type == "number" and not isinstance(value, (int, float)):
-            raise ValueError(f"Parameter '{param_name}' must be number")
-        if p_type == "integer" and not isinstance(value, int):
-            raise ValueError(f"Parameter '{param_name}' must be integer")
-        if p_type == "boolean" and not isinstance(value, bool):
-            raise ValueError(f"Parameter '{param_name}' must be boolean")
-
-    return answer
-
-
-def truncate_for_log(text: str, limit: int = RAW_ANSWER_SNIP_LEN) -> str:
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}… (truncated, {len(text)} chars)"
-
-
 def iter_prompt_results(
     model: Small_LLM_Model,
     system_prompt: str,
@@ -186,28 +100,32 @@ def iter_prompt_results(
     functions_by_name: dict[str, FunctionDefinition],
 ) -> Iterator[dict[str, Any]]:
     for prompt in prompts:
-        user_query = prompt.prompt
+        user_query = prompt.prompt.strip()
         print(f"Processing Query: {user_query}")
 
         validated_answer: FunctionCallAnswer | None = None
         raw_answer = ""
-        for attempt in range(MAX_RETRIES):
-            raw_answer = generate_answer(model, system_prompt, user_query)
+        base_prompt = system_prompt
+
+        for att in range(MAX_RETRIES):
+            if att == 0:
+                retry_prompt = base_prompt
+            else:
+                retry_prompt = base_prompt + "\nONLY VALID JSON."
+
+            raw_answer = generate_answer(model, retry_prompt, user_query)
+
             try:
                 parsed = parse_function_call_dict(raw_answer)
                 validated_answer = validate_answer(parsed, functions_by_name)
                 break
-            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-                print(
-                    f"Retry {attempt + 1}/{MAX_RETRIES}"
-                    f" because answer is invalid: {exc!s}. "
-                    f"raw_snip={truncate_for_log(raw_answer)!r}"
-                )
+            except Exception as exc:
+                print(f"Retry {att+1}: {exc}")
 
         if validated_answer is None:
             answer_payload: Any = {
                 "error": "invalid_model_output",
-                "raw_answer_snip": truncate_for_log(raw_answer),
+                "raw_answer_snip": {raw_answer},
             }
         else:
             answer_payload = validated_answer.model_dump()
@@ -220,20 +138,7 @@ def iter_prompt_results(
         print("-" * 20)
 
 
-def jsonl_to_json_array(jsonl_path: Path, json_path: Path) -> None:
-    rows: list[dict[str, Any]] = []
-    with jsonl_path.open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    with json_path.open("w", encoding="utf-8") as file:
-        json.dump(rows, file, indent=4, ensure_ascii=False)
-
-
-def main():
+def main() -> None:
     start_time = time.perf_counter()
     try:
         args = parse()
@@ -253,21 +158,21 @@ def main():
         functions_by_name = {f.name: f for f in functions}
 
     except FileNotFoundError as e:
-        print(f"CRITICAL: File not found - {e.filename}")
+        print(f"File not found - {e.filename}")
         return
     except json.JSONDecodeError as e:
-        print(f"CRITICAL: Invalid JSON format in input files - {e}")
+        print(f"Invalid JSON format in input files - {e}")
         return
     except ValidationError as e:
-        print(f"CRITICAL: Data validation failed (Pydantic):\n{e}")
+        print(f"CData validation failed (Pydantic):\n{e}")
         return
     except Exception as e:
-        print(f"CRITICAL: Unexpected error during initialization: {e}")
+        print(f"Unexpected error during initialization: {e}")
         return
 
     model = Small_LLM_Model(
         model_name="Qwen/Qwen3-0.6B",
-        device=choose_device())
+        )
     system_prompt = build_system_prompt(functions)
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -285,7 +190,7 @@ def main():
         jsonl_to_json_array(OUTPUT_PATH.with_suffix('.jsonl'), OUTPUT_PATH)
         end_time = time.perf_counter()
         final_time = end_time - start_time
-        print(f"{final_time//60} mins {final_time % 60} seconds")
+        print(f"{int(final_time//60)} mins {int(final_time % 60)} seconds")
         print(f"Success! Results saved to {OUTPUT_PATH}")
 
     except Exception as e:
