@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ParameterDefinition(BaseModel):
@@ -22,7 +22,7 @@ class FunctionDefinition(BaseModel):
 
     name: str
     description: str
-    parameters: dict[str, ParameterDefinition]
+    parameters: dict[str, ParameterDefinition] = Field(min_length=1)
     returns: ReturnDefinition
 
 

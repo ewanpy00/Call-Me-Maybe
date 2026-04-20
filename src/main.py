@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 import torch
 import time
 
@@ -18,6 +18,7 @@ from src.json_helpers import extract_first_json_object
 
 MAX_NEW_TOKENS = 256
 MAX_RETRIES = 3
+
 
 
 def parse() -> argparse.Namespace:
@@ -50,6 +51,8 @@ The JSON must have this shape:
 
 Available functions:
 {json.dumps([f.model_dump() for f in functions], indent=2)}
+
+If none of the functions match or parameters are invalid just set 'None' as 'name' value
 """
 
 
@@ -57,7 +60,7 @@ def generate_answer(
     model: Small_LLM_Model,
     system_prompt: str,
     user_query: str,
-) -> str:
+) -> Union[str, None]:
     user_query = user_query.replace("'", '"')
     final_prompt = f"{system_prompt}\nUser query: {user_query}\nResult: "
     ids = model.encode(final_prompt)[0].tolist()
@@ -69,7 +72,8 @@ def generate_answer(
 
         token_text = model.decode([next_token_id])
         generated_text += token_text
-
+        if "None" in token_text:
+            return None
         if "}" in token_text:
             maybe_json = extract_first_json_object(generated_text)
             if maybe_json is not None:
@@ -99,41 +103,45 @@ def iter_prompt_results(
     prompts: list[PromptItem],
     functions_by_name: dict[str, FunctionDefinition],
 ) -> Iterator[dict[str, Any]]:
+
     for prompt in prompts:
         user_query = prompt.prompt.strip()
+
+        if not user_query:
+            print("Skipping empty prompt")
+            continue
+
         print(f"Processing Query: {user_query}")
 
         validated_answer: FunctionCallAnswer | None = None
         raw_answer = ""
-        base_prompt = system_prompt
 
         for att in range(MAX_RETRIES):
-            if att == 0:
-                retry_prompt = base_prompt
-            else:
-                retry_prompt = base_prompt + "\nONLY VALID JSON."
+            retry_prompt = system_prompt if att == 0 else system_prompt + "\nONLY VALID JSON."
 
             raw_answer = generate_answer(model, retry_prompt, user_query)
+
+            if not raw_answer:
+                print(f"Retry {att+1}: empty model output")
+                continue
 
             try:
                 parsed = parse_function_call_dict(raw_answer)
                 validated_answer = validate_answer(parsed, functions_by_name)
                 break
+
             except Exception as exc:
                 print(f"Retry {att+1}: {exc}")
 
         if validated_answer is None:
-            answer_payload: Any = {
-                "error": "invalid_model_output",
-                "raw_answer_snip": {raw_answer},
-            }
-        else:
-            answer_payload = validated_answer.model_dump()
+            print("Skipping prompt due to invalid model output")
+            continue
 
         yield {
             "prompt": user_query,
-            **answer_payload
+            **validated_answer.model_dump(),
         }
+
         print("Done.")
         print("-" * 20)
 
@@ -184,6 +192,12 @@ def main() -> None:
                                            system_prompt,
                                            prompts,
                                            functions_by_name):
+                if row is None:
+                    print("Skipping due to invalid input")
+                    continue
+                if row['name'].strip() == "None":
+                    print("Skipping invalid prompt")
+                    continue
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 f.flush()
 
