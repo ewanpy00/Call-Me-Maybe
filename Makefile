@@ -8,6 +8,9 @@ install:
 run:
 	uv run python -m src -function_definition $(f) -input $(i) -output $(o)
 
+run-visualize:
+	uv run python -m src -function_definition $(f) -input $(i) -output $(o) -v
+
 debug:
 	uv run python -m pdb -m src
 

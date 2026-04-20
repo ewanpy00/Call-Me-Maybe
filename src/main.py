@@ -4,7 +4,7 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Union
-import torch
+import numpy as np
 import time
 
 from llm_sdk.llm_sdk import Small_LLM_Model
@@ -20,9 +20,13 @@ MAX_NEW_TOKENS = 256
 MAX_RETRIES = 3
 
 
-
 def parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Project Runner")
+    parser.add_argument("-v",
+                        "--visualize",
+                        action="store_true",
+                        help="Enable visualization of generation"
+                        )
     parser.add_argument(
                         "-function_definition",
                         type=str,
@@ -56,24 +60,45 @@ If none of the functions match or parameters are invalid just set 'None' as 'nam
 """
 
 
+def visualize_ids(prompt: str, model: Small_LLM_Model) -> dict:
+    dict_ids = {}
+    for i in prompt:
+        dict_ids[i] = model.encode(i)[0]
+
+    print(dict_ids)
+    return dict_ids
+
+
 def generate_answer(
     model: Small_LLM_Model,
     system_prompt: str,
     user_query: str,
-) -> Union[str, None]:
+    visual: bool
+) -> Union[str,  Any]:
     user_query = user_query.replace("'", '"')
     final_prompt = f"{system_prompt}\nUser query: {user_query}\nResult: "
     ids = model.encode(final_prompt)[0].tolist()
+    if visual:
+        print("\n" + "=" * 40)
+        d = visualize_ids(final_prompt, model)
     generated_text = ""
+    if visual:
+        print(
+            "\nProcessing prompt (system prompt ", end="")
+        print(f"+ input prompt): {final_prompt}\n\n")
+        print(f"Ids for the given prompt: {d}")
+        print("\n" + "=" * 40 + "Logits generation" + "=" * 40)
+        print()
     for _ in range(MAX_NEW_TOKENS):
         logits = model.get_logits_from_input_ids(ids)
-        next_token_id = int(torch.tensor(logits).argmax().item())
+        next_token_id = int(np.argmax(logits))
         ids.append(next_token_id)
 
         token_text = model.decode([next_token_id])
+        if visual:
+            print(f"Next word: {token_text}")
         generated_text += token_text
-        if "None" in token_text:
-            return None
+
         if "}" in token_text:
             maybe_json = extract_first_json_object(generated_text)
             if maybe_json is not None:
@@ -81,8 +106,7 @@ def generate_answer(
 
     full_generated = model.decode(ids).split(
         "Result: ", maxsplit=1)[-1].strip()
-    maybe_json = extract_first_json_object(full_generated)
-    return maybe_json or full_generated
+    return full_generated
 
 
 def parse_function_call_dict(raw: str) -> dict[str, Any]:
@@ -102,36 +126,36 @@ def iter_prompt_results(
     system_prompt: str,
     prompts: list[PromptItem],
     functions_by_name: dict[str, FunctionDefinition],
+    visual: bool
 ) -> Iterator[dict[str, Any]]:
-
     for prompt in prompts:
         user_query = prompt.prompt.strip()
-
         if not user_query:
             print("Skipping empty prompt")
             continue
-
-        print(f"Processing Query: {user_query}")
+        print(f"\nProcessing Prompt: {user_query}")
 
         validated_answer: FunctionCallAnswer | None = None
         raw_answer = ""
+        base_prompt = system_prompt
 
         for att in range(MAX_RETRIES):
-            retry_prompt = system_prompt if att == 0 else system_prompt + "\nONLY VALID JSON."
+            if att == 0:
+                retry_prompt = base_prompt
+            else:
+                retry_prompt = base_prompt + "\nONLY VALID JSON."
 
-            raw_answer = generate_answer(model, retry_prompt, user_query)
-
-            if not raw_answer:
-                print(f"Retry {att+1}: empty model output")
-                continue
+            raw_answer = generate_answer(
+                model, retry_prompt, user_query, visual)
 
             try:
                 parsed = parse_function_call_dict(raw_answer)
                 validated_answer = validate_answer(parsed, functions_by_name)
                 break
-
             except Exception as exc:
-                print(f"Retry {att+1}: {exc}")
+                base_prompt += "\nPrevious attempt failed "
+                base_prompt += f"with error: {str(exc)}. Please fix it."
+                print(f"Retry {att+1} initiated due to: {exc}")
 
         if validated_answer is None:
             print("Skipping prompt due to invalid model output")
@@ -155,7 +179,6 @@ def main() -> None:
         FUNCTIONS_PATH = Path(args.function_definition)
     except SystemExit:
         return
-
     try:
         prompts_raw = load_json(PROMPTS_PATH)
         functions_raw = load_json(FUNCTIONS_PATH)
@@ -172,7 +195,7 @@ def main() -> None:
         print(f"Invalid JSON format in input files - {e}")
         return
     except ValidationError as e:
-        print(f"CData validation failed (Pydantic):\n{e}")
+        print(f"CData validation failed (Pydantic): {e}")
         return
     except Exception as e:
         print(f"Unexpected error during initialization: {e}")
@@ -204,6 +227,7 @@ def main() -> None:
         jsonl_to_json_array(OUTPUT_PATH.with_suffix('.jsonl'), OUTPUT_PATH)
         end_time = time.perf_counter()
         final_time = end_time - start_time
+        print(" Whole code was processed in ", end="")
         print(f"{int(final_time//60)} mins {int(final_time % 60)} seconds")
         print(f"Success! Results saved to {OUTPUT_PATH}")
 
